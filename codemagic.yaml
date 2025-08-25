@@ -11,7 +11,7 @@ workflows:
       vars:
         EXPO_NO_TELEMETRY: "1"
         NODE_OPTIONS: "--max_old_space_size=4096"
-        CI: "1"                       # make expo non-interactive
+        CI: "1"   # make expo non-interactive
 
     cache:
       cache_paths:
@@ -36,13 +36,14 @@ workflows:
       - name: Resolve bundle identifiers from Expo config
         script: |
           INFO=$(npx expo config --json)
-          IOS_BUNDLE_ID=$(echo "$INFO" | python3 -c "import sys,json; d=json.load(sys.stdin); print((d.get('ios') or {}).get('bundleIdentifier',''))")
-          ANDROID_APP_ID=$(echo "$INFO" | python3 -c "import sys,json; d=json.load(sys.stdin); print((d.get('android') or {}).get('package',''))")
+          IOS_BUNDLE_ID=$(echo "$INFO" | python3 -c 'import sys,json; d=json.load(sys.stdin); print((d.get("ios") or {}).get("bundleIdentifier",""))')
+          ANDROID_APP_ID=$(echo "$INFO" | python3 -c 'import sys,json; d=json.load(sys.stdin); print((d.get("android") or {}).get("package",""))')
           if [ -z "$IOS_BUNDLE_ID" ] || [ -z "$ANDROID_APP_ID" ]; then
             echo "Failed to resolve bundle identifiers from Expo config"; exit 1
           fi
           echo "IOS_BUNDLE_ID=$IOS_BUNDLE_ID" >> $CM_ENV
           echo "ANDROID_APP_ID=$ANDROID_APP_ID" >> $CM_ENV
+          echo "Resolved iOS: $IOS_BUNDLE_ID, Android: $ANDROID_APP_ID"
 
       - name: Prebuild (force-generate ios/ and android/)
         script: |
@@ -130,20 +131,33 @@ workflows:
             --issuer-id "$APPLE_API_ISSUER_ID" \
             --key-id "$APPLE_API_KEY_ID" \
             --private-key "$APP_STORE_PRIVATE_KEY" \
-            --type IOS_APP_STORE \
-            "$IOS_BUNDLE_ID" \
-            --create
+            --type IOS_APP_STORE "$IOS_BUNDLE_ID" --create
           keychain initialize
           keychain add-certificates
           xcode-project use-profiles
 
-      - name: iOS | Build IPA
+      - name: iOS | Build IPA (auto-pick app scheme, not Pods/boost)
         script: |
-          SCHEME=$(xcodebuild -list -json -workspace ios/*.xcworkspace | python3 -c "import sys,json; d=json.load(sys.stdin); print((d.get('workspace') or {}).get('schemes',[None])[0] or '')")
-          if [ -z "$SCHEME" ]; then
-            echo "Could not determine Xcode scheme"; exit 1
+          set -e
+          WS=$(ls ios/*.xcworkspace | head -n1)
+          echo "Workspace: $WS"
+          SCHEMES=$(xcodebuild -list -json -workspace "$WS" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("\n".join((d.get("workspace") or {}).get("schemes",[])))')
+          echo "Found schemes:"; echo "$SCHEMES"
+          PICK=""
+          for S in $SCHEMES; do
+            case "$S" in
+              Pods-*|*Tests|*UITests|boost) continue ;;
+            esac
+            echo "Testing scheme: $S"
+            if xcodebuild -showBuildSettings -workspace "$WS" -scheme "$S" | grep -q "WRAPPER_EXTENSION = app"; then
+              PICK="$S"; break
+            fi
+          done
+          if [ -z "$PICK" ]; then
+            echo "Could not find an app scheme. Schemes were:"; echo "$SCHEMES"; exit 1
           fi
-          xcode-project build-ipa --workspace ios/*.xcworkspace --scheme "$SCHEME"
+          echo "Using app scheme: $PICK"
+          xcode-project build-ipa --workspace "$WS" --scheme "$PICK" --archive-method app-store --verbose
 
     artifacts:
       - android/app/build/outputs/bundle/release/*.aab
