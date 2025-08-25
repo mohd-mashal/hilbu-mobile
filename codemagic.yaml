@@ -11,6 +11,7 @@ workflows:
       vars:
         EXPO_NO_TELEMETRY: "1"
         NODE_OPTIONS: "--max_old_space_size=4096"
+        CI: "1"                       # make expo non-interactive
 
     cache:
       cache_paths:
@@ -43,19 +44,27 @@ workflows:
           echo "IOS_BUNDLE_ID=$IOS_BUNDLE_ID" >> $CM_ENV
           echo "ANDROID_APP_ID=$ANDROID_APP_ID" >> $CM_ENV
 
-      - name: Prebuild native projects if any folder is missing (generate both)
+      - name: Prebuild (force-generate ios/ and android/)
         script: |
-          NEED_ANDROID=0; [ -d "android" ] || NEED_ANDROID=1
-          NEED_IOS=0; [ -d "ios" ] || NEED_IOS=1
-          if [ $NEED_ANDROID -eq 1 ] || [ $NEED_IOS -eq 1 ]; then
-            echo "Running expo prebuild for ios,android (one shot)"
-            npx expo prebuild --non-interactive --platform ios,android
-          else
-            echo "Native projects already present, skipping expo prebuild."
+          set -e
+          echo "== Primary attempt: expo prebuild ios,android =="
+          npx expo prebuild --platform ios,android --clean || true
+
+          echo "== Verify and fallback if needed =="
+          if [ ! -d ios ]; then
+            echo "ios/ missing -> fallback: npx expo run:ios --no-install"
+            npx expo run:ios --no-install || true
           fi
-          echo "Folders after prebuild:"
-          ls -la | sed -n '1,200p'
-          [ -d ios ] && echo "✅ ios/ exists" || { echo "❌ ios/ still missing"; exit 1; }
+          if [ ! -d android ]; then
+            echo "android/ missing -> fallback: npx expo run:android --no-install"
+            npx expo run:android --no-install || true
+          fi
+
+          echo "== Final check =="
+          ls -la
+          [ -d ios ] || { echo "❌ ios/ still missing after fallback"; exit 1; }
+          [ -d android ] || { echo "❌ android/ still missing after fallback"; exit 1; }
+          echo "✅ ios/ and android/ exist"
 
       - name: 🔢 Automatic Version Bumping (Android versionCode & iOS buildNumber)
         script: |
