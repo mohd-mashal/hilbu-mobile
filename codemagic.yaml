@@ -1,116 +1,148 @@
 workflows:
-  android_release:
-    name: HILBU • Android Release (.aab)
-    max_build_duration: 60
-    environment:
-      node: 18.20.4
-      java: 17
-      vars:
-        APPLICATION_ID_ANDROID: com.hilbu.recovery
-    triggering:
-      events: [push]
-      branch_patterns:
-        - pattern: main
-          include: true
-          source: true
-    cache:
-      cache_paths:
-        - $HOME/.npm
-        - ~/.gradle
-        - android/.gradle
-    scripts:
-      - name: Install dependencies
-        script: |
-          npm ci
-      - name: Prebuild native projects if missing
-        script: |
-          if [ ! -d "android" ] || [ ! -d "ios" ]; then
-            npx expo prebuild --non-interactive --platform android,ios
-          fi
-      - name: Decode and place Android keystore (from env)
-        script: |
-          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/release.keystore
-      - name: Build Android App Bundle
-        script: |
-          cd android
-          ./gradlew clean bundleRelease \
-            -Pandroid.injected.signing.store.file=release.keystore \
-            -Pandroid.injected.signing.store.password="$ANDROID_KEYSTORE_PASSWORD" \
-            -Pandroid.injected.signing.key.alias="$ANDROID_KEY_ALIAS" \
-            -Pandroid.injected.signing.key.password="$ANDROID_KEY_PASSWORD"
-    artifacts:
-      - android/app/build/outputs/bundle/release/*.aab
+  hilbu_release:
+    name: HILBU • Android AAB + iOS TestFlight
+    instance_type: mac_mini_m2
+    max_build_duration: 120
 
-  ios_release:
-    name: HILBU • iOS Release (TestFlight/.ipa)
-    max_build_duration: 90
     environment:
-      node: 18.20.4
-      xcode: 15.4
-      cocoapods: default
-      ios_signing:
-        distribution_type: app-store
-        app_store_connect:
-          key_id: $APPLE_API_KEY_ID
-          issuer_id: $APPLE_API_ISSUER_ID
-          private_key: $APP_STORE_PRIVATE_KEY
       vars:
-        BUNDLE_ID_IOS: com.hilbu.recovery
-    triggering:
-      events: [push]
-      branch_patterns:
-        - pattern: main
-          include: true
-          source: true
+        EXPO_NO_TELEMETRY: "1"
+        NODE_OPTIONS: "--max_old_space_size=4096"
+        # Your secure env vars already exist in Codemagic:
+        # ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD
+        # APP_STORE_PRIVATE_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER_ID
+        # ANDROID_GOOGLE_MAPS_API_KEY, IOS_GOOGLE_MAPS_API_KEY, EXPO_PUBLIC_TAP_MODE
+
     cache:
       cache_paths:
-        - $HOME/.npm
+        - ~/.npm
+        - ~/.gradle/caches
+        - ~/.gradle/wrapper
         - $HOME/Library/Caches/CocoaPods
-        - $HOME/Library/Developer/Xcode/DerivedData
+        - ios/Pods
+
     scripts:
-      - name: Install dependencies
+      - name: Use Java 17
         script: |
-          npm ci
-      - name: Prebuild iOS if missing
+          echo 'export JAVA_HOME=$(/usr/libexec/java_home -v 17)' >> $CM_ENV
+          java -version
+
+      - name: Install Node deps
+        script: npm ci
+
+      - name: Ensure Expo CLI
+        script: npx --yes expo --version
+
+      - name: Resolve bundle identifiers from Expo config
         script: |
-          if [ ! -d "ios" ]; then
-            npx expo prebuild --non-interactive --platform ios
+          INFO=$(npx expo config --json)
+          IOS_BUNDLE_ID=$(echo "$INFO" | python3 -c "import sys,json; d=json.load(sys.stdin); print((d.get('ios') or {}).get('bundleIdentifier',''))")
+          ANDROID_APP_ID=$(echo "$INFO" | python3 -c "import sys,json; d=json.load(sys.stdin); print((d.get('android') or {}).get('package',''))")
+          if [ -z "$IOS_BUNDLE_ID" ] || [ -z "$ANDROID_APP_ID" ]; then
+            echo "Failed to resolve bundle identifiers from Expo config"; exit 1
           fi
+          echo "IOS_BUNDLE_ID=$IOS_BUNDLE_ID" >> $CM_ENV
+          echo "ANDROID_APP_ID=$ANDROID_APP_ID" >> $CM_ENV
+          echo "iOS: $IOS_BUNDLE_ID, Android: $ANDROID_APP_ID"
+
+      - name: Prebuild native projects only if missing
+        script: |
+          NEED_ANDROID=0; [ -d "android" ] || NEED_ANDROID=1
+          NEED_IOS=0; [ -d "ios" ] || NEED_IOS=1
+          if [ $NEED_ANDROID -eq 1 ] || [ $NEED_IOS -eq 1 ]; then
+            PLATFORMS=""
+            [ $NEED_ANDROID -eq 1 ] && PLATFORMS="android"
+            [ $NEED_IOS -eq 1 ] && PLATFORMS="${PLATFORMS:+$PLATFORMS,}ios"
+            echo "Running expo prebuild for: $PLATFORMS"
+            npx expo prebuild --non-interactive --platform "$PLATFORMS"
+          else
+            echo "Native projects already present, skipping expo prebuild."
+          fi
+
+      - name: 🔢 Automatic Version Bumping (Android versionCode & iOS buildNumber)
+        script: |
+          # Use Codemagic BUILD_NUMBER if present, else fall back to a safe integer
+          BN="${BUILD_NUMBER:-0}"
+          if [ "$BN" = "0" ] || ! echo "$BN" | grep -Eq '^[0-9]+$'; then
+            # fallback: use last 6 digits of current epoch to avoid collisions
+            BN=$(date +%s | tail -c 7)
+          fi
+          echo "Using build number: $BN"
+
+          # --- Android: bump versionCode in build.gradle / build.gradle.kts
+          if [ -f android/app/build.gradle ]; then
+            echo "Patching android/app/build.gradle versionCode -> $BN"
+            sed -i '' -E "s/(versionCode\s+)[0-9]+/\1${BN}/" android/app/build.gradle
+          elif [ -f android/app/build.gradle.kts ]; then
+            echo "Patching android/app/build.gradle.kts versionCode -> $BN"
+            sed -i '' -E "s/(versionCode\s*\()\s*[0-9]+(\))/\1${BN}\2/" android/app/build.gradle.kts
+          else
+            echo "WARN: build.gradle not found, skipping Android version bump."
+          fi
+
+          # --- iOS: set CFBundleVersion (buildNumber) in all Info.plist
+          if [ -d ios ]; then
+            /usr/libexec/PlistBuddy -c "Print" /dev/null 2>/dev/null
+            PLISTS=$(find ios -name "Info.plist")
+            for P in $PLISTS; do
+              echo "Setting CFBundleVersion -> $BN in $P"
+              /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BN" "$P" 2>/dev/null || \
+              /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BN" "$P"
+            done
+          else
+            echo "WARN: ios/ not found, skipping iOS version bump."
+          fi
+
       - name: Install CocoaPods
         script: |
           cd ios
           pod install --repo-update
-      - name: Xcode archive
+          cd ..
+
+      - name: Android | Decode keystore from Base64
         script: |
-          cd ios
-          WORKSPACE=$(ls *.xcworkspace | head -n1)
-          SCHEME=$(ls *.xcodeproj | head -n1 | sed 's/.xcodeproj//')
-          xcodebuild -workspace "$WORKSPACE" \
-            -scheme "$SCHEME" \
-            -configuration Release \
-            -archivePath $CM_BUILD_DIR/build/HILBU.xcarchive \
-            clean archive \
-            PRODUCT_BUNDLE_IDENTIFIER=$BUNDLE_ID_IOS \
-            CODE_SIGN_STYLE=Automatic \
-            | xcpretty
-      - name: Export IPA
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/hilbu-upload.keystore
+          ls -lh android/hilbu-upload.keystore
+
+      - name: Android | Build signed AAB (bundleRelease)
         script: |
-          xcodebuild -exportArchive \
-            -archivePath $CM_BUILD_DIR/build/HILBU.xcarchive \
-            -exportOptionsPlist <(printf '%s' '
-              {
-                "method": "app-store",
-                "uploadSymbols": true,
-                "compileBitcode": false
-              }') \
-            -exportPath $CM_BUILD_DIR/build/export \
-            | xcpretty
+          cd android
+          ./gradlew clean bundleRelease \
+            -Pandroid.injected.signing.store.file="$CM_BUILD_DIR/android/hilbu-upload.keystore" \
+            -Pandroid.injected.signing.store.password="$ANDROID_KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$ANDROID_KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$ANDROID_KEY_PASSWORD" \
+            --no-daemon --stacktrace
+          cd ..
+
+      - name: iOS | Fetch signing files and set profiles
+        script: |
+          app-store-connect fetch-signing-files \
+            --issuer-id "$APPLE_API_ISSUER_ID" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --private-key "$APP_STORE_PRIVATE_KEY" \
+            --type IOS_APP_STORE \
+            "$IOS_BUNDLE_ID" \
+            --create
+          keychain initialize
+          keychain add-certificates
+          xcode-project use-profiles
+
+      - name: iOS | Build IPA
+        script: |
+          SCHEME=$(xcodebuild -list -json -workspace ios/*.xcworkspace | python3 -c "import sys,json; d=json.load(sys.stdin); print((d.get('workspace') or {}).get('schemes',[None])[0] or '')")
+          if [ -z "$SCHEME" ]; then
+            echo "Could not determine Xcode scheme"; exit 1
+          fi
+          xcode-project build-ipa --workspace ios/*.xcworkspace --scheme "$SCHEME"
+
     artifacts:
-      - build/export/*.ipa
-      - build/HILBU.xcarchive/dSYMs/**/*.dSYM
+      - android/app/build/outputs/bundle/release/*.aab
+      - build/ios/ipa/*.ipa
+
     publishing:
       app_store_connect:
+        api_key: $APP_STORE_PRIVATE_KEY
         key_id: $APPLE_API_KEY_ID
         issuer_id: $APPLE_API_ISSUER_ID
-        private_key: $APP_STORE_PRIVATE_KEY
         submit_to_testflight: true
