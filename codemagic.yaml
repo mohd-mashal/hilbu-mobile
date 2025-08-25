@@ -1,6 +1,3 @@
-# HILBU (Expo) — Codemagic CI/CD
-# Builds Android .aab + iOS .ipa using ONLY environment variables (no Code signing UI needed)
-
 workflows:
   android_release:
     name: HILBU • Android Release (.aab)
@@ -33,7 +30,7 @@ workflows:
       - name: Decode and place Android keystore (from env)
         script: |
           echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/release.keystore
-      - name: Build Android App Bundle (release)
+      - name: Build Android App Bundle
         script: |
           cd android
           ./gradlew clean bundleRelease \
@@ -53,7 +50,6 @@ workflows:
       cocoapods: default
       ios_signing:
         distribution_type: app-store
-        # Using variables (no .p8 upload UI required)
         app_store_connect:
           key_id: $APPLE_API_KEY_ID
           issuer_id: $APPLE_API_ISSUER_ID
