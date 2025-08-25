@@ -8,9 +8,9 @@ workflows:
       vars:
         EXPO_NO_TELEMETRY: "1"
         NODE_OPTIONS: "--max_old_space_size=4096"
-        # Secure env vars must already exist in Codemagic:
-        # ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD
-        # APP_STORE_PRIVATE_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER_ID
+        # UI env vars expected: ANDROID_KEYSTORE_BASE64 (or ANDROID_KEYSTORE as a file var),
+        # ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD,
+        # APP_STORE_PRIVATE_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER_ID,
         # ANDROID_GOOGLE_MAPS_API_KEY, IOS_GOOGLE_MAPS_API_KEY, EXPO_PUBLIC_TAP_MODE
 
     cache:
@@ -96,17 +96,40 @@ workflows:
           pod install --repo-update
           cd ..
 
-      - name: Android | Decode keystore from Base64
+      - name: ✅ Check required env vars (no secrets shown)
         script: |
+          check() { if [ -z "${!1:-}" ]; then echo "MISSING: $1"; else echo "OK: $1"; fi }
+          echo "Verifying Android signing env vars..."
+          check ANDROID_KEYSTORE_BASE64
+          check ANDROID_KEYSTORE
+          check ANDROID_KEYSTORE_PASSWORD
+          check ANDROID_KEY_ALIAS
+          check ANDROID_KEY_PASSWORD
+          echo "Verifying Apple upload env vars..."
+          check APP_STORE_PRIVATE_KEY
+          check APPLE_API_KEY_ID
+          check APPLE_API_ISSUER_ID
+
+      - name: Android | Decode keystore (supports Base64 OR file-var)
+        script: |
+          set -e
           mkdir -p android
-          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
-            echo "Missing ANDROID_KEYSTORE_BASE64"; exit 1
+          OUT="android/hilbu-upload.keystore"
+
+          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ]; then
+            echo "Decoding ANDROID_KEYSTORE_BASE64 -> $OUT"
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$OUT" || { echo "Base64 decode failed"; exit 1; }
+          elif [ -n "${ANDROID_KEYSTORE:-}" ] && [ -f "$ANDROID_KEYSTORE" ]; then
+            echo "Copying ANDROID_KEYSTORE file-var -> $OUT"
+            cp "$ANDROID_KEYSTORE" "$OUT"
+          else
+            echo "ERROR: Neither ANDROID_KEYSTORE_BASE64 nor ANDROID_KEYSTORE (file var) is available."; exit 1
           fi
-          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/hilbu-upload.keystore
-          if [ ! -s android/hilbu-upload.keystore ]; then
-            echo "Decoded keystore is empty"; exit 1
+
+          if [ ! -s "$OUT" ]; then
+            echo "ERROR: Keystore file is empty or missing at $OUT"; exit 1
           fi
-          ls -lh android/hilbu-upload.keystore
+          ls -lh "$OUT"
 
       - name: Android | Build signed AAB (bundleRelease)
         script: |
