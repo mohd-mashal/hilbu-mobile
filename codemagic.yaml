@@ -8,7 +8,7 @@ workflows:
       vars:
         EXPO_NO_TELEMETRY: "1"
         NODE_OPTIONS: "--max_old_space_size=4096"
-        # Your secure env vars already exist in Codemagic:
+        # Secure env vars must already exist in Codemagic:
         # ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD
         # APP_STORE_PRIVATE_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER_ID
         # ANDROID_GOOGLE_MAPS_API_KEY, IOS_GOOGLE_MAPS_API_KEY, EXPO_PUBLIC_TAP_MODE
@@ -61,15 +61,13 @@ workflows:
 
       - name: 🔢 Automatic Version Bumping (Android versionCode & iOS buildNumber)
         script: |
-          # Use Codemagic BUILD_NUMBER if present, else fall back to a safe integer
           BN="${BUILD_NUMBER:-0}"
           if [ "$BN" = "0" ] || ! echo "$BN" | grep -Eq '^[0-9]+$'; then
-            # fallback: use last 6 digits of current epoch to avoid collisions
             BN=$(date +%s | tail -c 7)
           fi
           echo "Using build number: $BN"
 
-          # --- Android: bump versionCode in build.gradle / build.gradle.kts
+          # Android versionCode
           if [ -f android/app/build.gradle ]; then
             echo "Patching android/app/build.gradle versionCode -> $BN"
             sed -i '' -E "s/(versionCode\s+)[0-9]+/\1${BN}/" android/app/build.gradle
@@ -80,9 +78,8 @@ workflows:
             echo "WARN: build.gradle not found, skipping Android version bump."
           fi
 
-          # --- iOS: set CFBundleVersion (buildNumber) in all Info.plist
+          # iOS CFBundleVersion
           if [ -d ios ]; then
-            /usr/libexec/PlistBuddy -c "Print" /dev/null 2>/dev/null
             PLISTS=$(find ios -name "Info.plist")
             for P in $PLISTS; do
               echo "Setting CFBundleVersion -> $BN in $P"
@@ -101,7 +98,14 @@ workflows:
 
       - name: Android | Decode keystore from Base64
         script: |
+          mkdir -p android
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "Missing ANDROID_KEYSTORE_BASE64"; exit 1
+          fi
           echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/hilbu-upload.keystore
+          if [ ! -s android/hilbu-upload.keystore ]; then
+            echo "Decoded keystore is empty"; exit 1
+          fi
           ls -lh android/hilbu-upload.keystore
 
       - name: Android | Build signed AAB (bundleRelease)
