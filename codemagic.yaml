@@ -1,24 +1,4 @@
 workflows:
-  env_dump:
-    name: HILBU • Env dump (names only)
-    instance_type: mac_mini_m2
-    max_build_duration: 10
-    environment:
-      groups:
-        - hilbu_android
-        - hilbu_apple
-    scripts:
-      - name: Show env var NAMES that reach the build (no values)
-        script: |
-          echo "---- ANDROID_* present ----"
-          env | cut -d= -f1 | grep -E '^ANDROID_' || echo "(none)"
-          echo "---- APP_*/APPLE_* present ----"
-          env | cut -d= -f1 | grep -E '^(APP_|APPLE_)' || echo "(none)"
-          echo "---- EXPO_* present ----"
-          env | cut -d= -f1 | grep -E '^EXPO_' || echo "(none)"
-    artifacts:
-      - ./**
-
   hilbu_release:
     name: HILBU • Android AAB + iOS TestFlight
     instance_type: mac_mini_m2
@@ -63,28 +43,46 @@ workflows:
           echo "IOS_BUNDLE_ID=$IOS_BUNDLE_ID" >> $CM_ENV
           echo "ANDROID_APP_ID=$ANDROID_APP_ID" >> $CM_ENV
 
-      - name: Prebuild native projects only if missing
+      - name: Prebuild native projects if any folder is missing (generate both)
         script: |
           NEED_ANDROID=0; [ -d "android" ] || NEED_ANDROID=1
           NEED_IOS=0; [ -d "ios" ] || NEED_IOS=1
           if [ $NEED_ANDROID -eq 1 ] || [ $NEED_IOS -eq 1 ]; then
-            PLATFORMS=""
-            [ $NEED_ANDROID -eq 1 ] && PLATFORMS="android"
-            [ $NEED_IOS -eq 1 ] && PLATFORMS="${PLATFORMS:+$PLATFORMS,}ios"
-            npx expo prebuild --non-interactive --platform "$PLATFORMS"
+            echo "Running expo prebuild for ios,android (one shot)"
+            npx expo prebuild --non-interactive --platform ios,android
+          else
+            echo "Native projects already present, skipping expo prebuild."
           fi
+          echo "Folders after prebuild:"
+          ls -la | sed -n '1,200p'
+          [ -d ios ] && echo "✅ ios/ exists" || { echo "❌ ios/ still missing"; exit 1; }
 
-      - name: 🔢 Automatic Version Bumping (Android & iOS)
+      - name: 🔢 Automatic Version Bumping (Android versionCode & iOS buildNumber)
         script: |
           BN="${BUILD_NUMBER:-0}"
-          if [ "$BN" = "0" ] || ! echo "$BN" | grep -Eq '^[0-9]+$'; then BN=$(date +%s | tail -c 7); fi
-          if [ -f android/app/build.gradle ]; then sed -i '' -E "s/(versionCode\s+)[0-9]+/\1${BN}/" android/app/build.gradle; fi
-          if [ -f android/app/build.gradle.kts ]; then sed -i '' -E "s/(versionCode\s*\()\s*[0-9]+(\))/\1${BN}\2/" android/app/build.gradle.kts; fi
-          if [ -d ios ]; then for P in $(find ios -name "Info.plist"); do /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BN" "$P" 2>/dev/null || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BN" "$P"; done; fi
+          if [ "$BN" = "0" ] || ! echo "$BN" | grep -Eq '^[0-9]+$'; then
+            BN=$(date +%s | tail -c 7)
+          fi
+          echo "Using build number: $BN"
+
+          # Android versionCode
+          if [ -f android/app/build.gradle ]; then
+            sed -i '' -E "s/(versionCode\s+)[0-9]+/\1${BN}/" android/app/build.gradle
+          elif [ -f android/app/build.gradle.kts ]; then
+            sed -i '' -E "s/(versionCode\s*\()\s*[0-9]+(\))/\1${BN}\2/" android/app/build.gradle.kts
+          fi
+
+          # iOS CFBundleVersion
+          for P in $(find ios -name "Info.plist"); do
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BN" "$P" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BN" "$P"
+          done
 
       - name: Install CocoaPods
         script: |
-          cd ios && pod install --repo-update && cd ..
+          cd ios
+          pod install --repo-update
+          cd ..
 
       - name: ✅ Quick env names (sanity check)
         script: |
@@ -123,7 +121,9 @@ workflows:
             --issuer-id "$APPLE_API_ISSUER_ID" \
             --key-id "$APPLE_API_KEY_ID" \
             --private-key "$APP_STORE_PRIVATE_KEY" \
-            --type IOS_APP_STORE "$IOS_BUNDLE_ID" --create
+            --type IOS_APP_STORE \
+            "$IOS_BUNDLE_ID" \
+            --create
           keychain initialize
           keychain add-certificates
           xcode-project use-profiles
@@ -131,7 +131,9 @@ workflows:
       - name: iOS | Build IPA
         script: |
           SCHEME=$(xcodebuild -list -json -workspace ios/*.xcworkspace | python3 -c "import sys,json; d=json.load(sys.stdin); print((d.get('workspace') or {}).get('schemes',[None])[0] or '')")
-          [ -n "$SCHEME" ] || { echo "No scheme"; exit 1; }
+          if [ -z "$SCHEME" ]; then
+            echo "Could not determine Xcode scheme"; exit 1
+          fi
           xcode-project build-ipa --workspace ios/*.xcworkspace --scheme "$SCHEME"
 
     artifacts:
