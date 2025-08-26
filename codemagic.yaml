@@ -170,7 +170,8 @@ workflows:
             exit 1
           fi
           echo "Using app scheme: $PICK"
-          xcode-project build-ipa --workspace "$WS" --scheme "$PICK" --archive-method app-store --verbose
+          # NOTE: use --export-method (not --archive-method)
+          xcode-project build-ipa --workspace "$WS" --scheme "$PICK" --export-method app-store --verbose
 
     artifacts:
       - android/app/build/outputs/bundle/release/*.aab
