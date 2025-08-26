@@ -170,8 +170,8 @@ workflows:
             exit 1
           fi
           echo "Using app scheme: $PICK"
-          # NOTE: use --export-method (not --archive-method)
-          xcode-project build-ipa --workspace "$WS" --scheme "$PICK" --export-method app-store --verbose
+          # Correct Codemagic CLI usage: no export/archive flags needed
+          xcode-project build-ipa --workspace "$WS" --scheme "$PICK" --verbose
 
     artifacts:
       - android/app/build/outputs/bundle/release/*.aab
