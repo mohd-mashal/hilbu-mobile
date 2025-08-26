@@ -136,13 +136,25 @@ workflows:
           keychain add-certificates
           xcode-project use-profiles
 
-      - name: iOS | Build IPA (auto-pick app scheme, not Pods/boost)
+      - name: iOS | Build IPA (robust workspace & scheme pick)
         script: |
           set -e
-          WS=$(ls ios/*.xcworkspace | head -n1)
+          set -o pipefail
+          # Find a real .xcworkspace directory (not its internal files)
+          WS=$(find ios -maxdepth 1 -type d -name "*.xcworkspace" | head -n1)
+          if [ -z "$WS" ]; then
+            echo "No .xcworkspace found, listing ios/:"; ls -la ios; exit 1
+          fi
           echo "Workspace: $WS"
-          SCHEMES=$(xcodebuild -list -json -workspace "$WS" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("\n".join((d.get("workspace") or {}).get("schemes",[])))')
-          echo "Found schemes:"; echo "$SCHEMES"
+          # List schemes safely
+          SCHEMES=$(xcodebuild -list -json -workspace "$WS" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("\n".join((d.get("workspace") or {}).get("schemes",[])))' || true)
+          if [ -z "$SCHEMES" ]; then
+            echo "Could not read schemes from workspace JSON; raw list:" 
+            xcodebuild -list -workspace "$WS" || true
+          else
+            echo "Found schemes:"; echo "$SCHEMES"
+          fi
+          # Pick the first app scheme (skip Pods/tests/boost)
           PICK=""
           for S in $SCHEMES; do
             case "$S" in
@@ -154,7 +166,8 @@ workflows:
             fi
           done
           if [ -z "$PICK" ]; then
-            echo "Could not find an app scheme. Schemes were:"; echo "$SCHEMES"; exit 1
+            echo "Could not find an app scheme among: $SCHEMES"
+            exit 1
           fi
           echo "Using app scheme: $PICK"
           xcode-project build-ipa --workspace "$WS" --scheme "$PICK" --archive-method app-store --verbose
