@@ -1,113 +1,125 @@
 workflows:
-  hilbu_release:
-    name: HILBU • Android AAB + iOS TestFlight
+  hilbu_expo_ci_cd:
+    name: HILBU | Expo RN (SDK 53) → Android AAB + iOS IPA
     instance_type: mac_mini_m2
     max_build_duration: 120
-
     environment:
-      groups:
-        - hilbu_android         # holds: ANDROID_KEYSTORE_BASE64 / PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD
-        - hilbu_apple           # holds: APP_STORE_PRIVATE_KEY / APPLE_API_KEY_ID / APPLE_API_ISSUER_ID
+      xcode: 16.4
+      node: 20
+      java: 17
+      # Uses your existing environment variables in Codemagic:
+      # ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD
+      # APP_STORE_PRIVATE_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER_ID
+      # ANDROID_GOOGLE_MAPS_API_KEY, IOS_GOOGLE_MAPS_API_KEY, EXPO_PUBLIC_TAP_MODE
       vars:
-        EXPO_NO_TELEMETRY: "1"
-        NODE_OPTIONS: "--max_old_space_size=4096"
-        CI: "1"                 # make expo non-interactive
-        EXPO_PUBLIC_TAP_MODE: "sandbox"
-        ANDROID_GOOGLE_MAPS_API_KEY: $ANDROID_GOOGLE_MAPS_API_KEY
-        IOS_GOOGLE_MAPS_API_KEY: $IOS_GOOGLE_MAPS_API_KEY
-
+        # Helps Expo non-interactive prebuilds
+        CI: "1"
     cache:
       cache_paths:
-        - ~/.npm
-        - ~/.gradle/caches
-        - ~/.gradle/wrapper
         - $HOME/Library/Caches/CocoaPods
         - ios/Pods
+        - ~/.gradle/caches
+        - ~/.gradle/wrapper
+        - $CM_BUILD_DIR/node_modules
+    triggering:
+      events:
+        - push
+        - pull_request
+      branch_patterns:
+        - pattern: "*"
+          include: true
+          source: true
 
     scripts:
-      - name: Use Java 17
+      - name: 🧰 Install tooling
         script: |
-          echo 'export JAVA_HOME=$(/usr/libexec/java_home -v 17)' >> $CM_ENV
-          java -version
+          npm ci
+          npm i -g eas-cli@latest
+          npm i -g expo-cli
 
-      - name: Install Node deps
-        script: npm ci
+      - name: 🧪 Quick env names (sanity check)
+        script: |
+          echo "---- ANDROID_* present ----"
+          env | grep -E "^ANDROID_" | cut -d= -f1 || true
+          echo "---- APP_*/APPLE_* present ----"
+          env | grep -E "^(APP_|APPLE_)" | cut -d= -f1 || true
+          echo "---- EXPO_* present ----"
+          env | grep -E "^EXPO_" | cut -d= -f1 || true
 
-      - name: Ensure Expo CLI
-        script: npx --yes expo --version
-
-      - name: Prebuild native projects (create ios/ & android/ if missing)
+      - name: 🏗️ Prebuild native projects if missing (ios and/or android)
         script: |
           set -e
-          if [ ! -d ios ] || [ ! -d android ]; then
-            npx expo prebuild --platform ios,android || true
+          NEED_ANDROID=0; [ -d "android" ] || NEED_ANDROID=1
+          NEED_IOS=0; [ -d "ios" ] || NEED_IOS=1
+
+          if [ $NEED_ANDROID -eq 1 ] || [ $NEED_IOS -eq 1 ]; then
+            echo "Running expo prebuild for ios,android (one shot)"
+            # --non-interactive is not supported; CI=1 already set
+            npx expo prebuild --platform ios,android --no-install
+          else
+            echo "Native projects already present, skipping expo prebuild."
           fi
-          # Fallbacks if one still missing
-          [ -d ios ]     || npx expo run:ios --no-install || true
-          [ -d android ] || npx expo run:android --no-install || true
-          [ -d ios ] && [ -d android ] || { echo "❌ Native folders missing after prebuild"; exit 1; }
+
+          echo "Folders after prebuild (top level):"
+          ls -la | sed -n '1,200p'
+
+          if [ ! -d ios ]; then
+            echo "❌ ios/ still missing after prebuild"; exit 1
+          fi
+          if [ ! -d android ]; then
+            echo "❌ android/ still missing after prebuild"; exit 1
+          fi
           echo "✅ ios/ and android/ exist"
 
-      - name: 🔢 Bump build numbers (Android versionCode & iOS CFBundleVersion)
-        script: |
-          BN="${BUILD_NUMBER:-0}"
-          if ! echo "$BN" | grep -Eq '^[0-9]+$' || [ "$BN" = "0" ]; then BN=$(date +%s | tail -c 7); fi
-          echo "Using build number: $BN"
-
-          # Android: versionCode (Gradle or KTS)
-          if [ -f android/app/build.gradle ]; then
-            sed -i '' -E "s/(versionCode\s+)[0-9]+/\1${BN}/" android/app/build.gradle || true
-          fi
-          if [ -f android/app/build.gradle.kts ]; then
-            sed -i '' -E "s/(versionCode\s*\()\s*[0-9]+(\))/\1${BN}\2/" android/app/build.gradle.kts || true
-          fi
-
-          # iOS: CFBundleVersion in all Info.plist files
-          for P in $(find ios -name "Info.plist"); do
-            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BN" "$P" 2>/dev/null || \
-            /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BN" "$P"
-          done
-
-      - name: Install CocoaPods
-        script: |
-          cd ios
-          pod install --repo-update
-          cd ..
-
-      - name: Resolve bundle identifiers from native (fallback to Expo if needed)
+      - name: 🍫 Install CocoaPods (only when ios/ exists)
         script: |
           set -e
-          IOS_PLIST=$(find ios -maxdepth 2 -name "Info.plist" | head -n1 || true)
-          IOS_BUNDLE_ID=""
-          if [ -n "$IOS_PLIST" ]; then
-            IOS_BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$IOS_PLIST" 2>/dev/null || true)
+          if [ -d ios ]; then
+            cd ios
+            pod repo update
+            pod install
+            cd ..
+          else
+            echo "ios/ not found; skipping pods"
           fi
-          ANDROID_APP_ID=""
-          if [ -f android/app/src/main/AndroidManifest.xml ]; then
-            ANDROID_APP_ID=$(grep -o 'package="[^"]*"' android/app/src/main/AndroidManifest.xml | head -n1 | cut -d\" -f2)
-          fi
-          if [ -z "$IOS_BUNDLE_ID" ] || [ -z "$ANDROID_APP_ID" ]; then
-            INFO=$(npx expo config --json)
-            [ -z "$IOS_BUNDLE_ID" ] && IOS_BUNDLE_ID=$(echo "$INFO" | python3 -c 'import sys,json; d=json.load(sys.stdin); print((d.get("ios") or {}).get("bundleIdentifier",""))')
-            [ -z "$ANDROID_APP_ID" ] && ANDROID_APP_ID=$(echo "$INFO" | python3 -c 'import sys,json; d=json.load(sys.stdin); print((d.get("android") or {}).get("package",""))')
-          fi
-          [ -n "$IOS_BUNDLE_ID" ] || { echo "Could not resolve iOS bundle id"; exit 1; }
-          [ -n "$ANDROID_APP_ID" ] || { echo "Could not resolve Android app id"; exit 1; }
-          echo "IOS_BUNDLE_ID=$IOS_BUNDLE_ID" >> $CM_ENV
-          echo "ANDROID_APP_ID=$ANDROID_APP_ID" >> $CM_ENV
-          echo "Resolved iOS: $IOS_BUNDLE_ID"
-          echo "Resolved Android: $ANDROID_APP_ID"
 
-      - name: ✅ Quick env names (sanity check)
+      - name: 🔢 Automatic Version Bumping (Android & iOS)
         script: |
-          echo "---- ANDROID_* present ----"; env | cut -d= -f1 | grep -E '^ANDROID_' || echo "(none)"
-          echo "---- APP_*/APPLE_* present ----"; env | cut -d= -f1 | grep -E '^(APP_|APPLE_)' || echo "(none)"
+          set -e
+
+          # ANDROID: bump versionCode in app/build.gradle (simple +1)
+          GRADLE_APP=android/app/build.gradle
+          if [ -f "$GRADLE_APP" ]; then
+            echo "Bumping Android versionCode…"
+            CURR=$(grep -m1 "versionCode" "$GRADLE_APP" | sed -E 's/.*versionCode[[:space:]]+([0-9]+).*/\1/')
+            [ -z "$CURR" ] && CURR=0
+            NEXT=$((CURR+1))
+            sed -i.bak -E "s/(versionCode[[:space:]]+)[0-9]+/\1${NEXT}/" "$GRADLE_APP"
+            echo "Android versionCode: $CURR → $NEXT"
+          fi
+
+          # iOS: bump CFBundleVersion (build number) via agvtool
+          if [ -d ios ]; then
+            cd ios
+            # Ensure a numeric build number; default to 1 if missing
+            PLIST=$(find . -maxdepth 2 -name "Info.plist" | head -n1)
+            if [ -n "$PLIST" ]; then
+              CURR=$(/usr/libexec/PlistBuddy -c "Print CFBundleVersion" "$PLIST" 2>/dev/null || echo "0")
+              [[ "$CURR" =~ ^[0-9]+$ ]] || CURR=0
+              NEXT=$((CURR+1))
+              /usr/libexec/PlistBuddy -c "Set CFBundleVersion $NEXT" "$PLIST" || true
+              echo "iOS CFBundleVersion: $CURR → $NEXT"
+            fi
+            cd ..
+          fi
 
       - name: Android | Decode keystore (supports Base64 OR file-var)
         script: |
+          #!/usr/bin/env bash
           set -e
           mkdir -p android
           OUT="android/hilbu-upload.keystore"
+
           if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ]; then
             echo "Decoding ANDROID_KEYSTORE_BASE64 -> $OUT"
             echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$OUT" || { echo "Base64 decode failed"; exit 1; }
@@ -117,39 +129,108 @@ workflows:
           else
             echo "ERROR: Neither ANDROID_KEYSTORE_BASE64 nor ANDROID_KEYSTORE (file var) is available."; exit 1
           fi
-          [ -s "$OUT" ] || { echo "ERROR: Keystore file is empty"; exit 1; }
+
+          if [ ! -s "$OUT" ]; then
+            echo "ERROR: Keystore file is empty or missing at $OUT"; exit 1
+          fi
           ls -lh "$OUT"
+
+      - name: Android | Configure Gradle signing from env
+        script: |
+          set -e
+          GP="android/gradle.properties"
+          touch "$GP"
+
+          # Ensure required envs exist
+          : "${ANDROID_KEYSTORE_PASSWORD:?Missing ANDROID_KEYSTORE_PASSWORD}"
+          : "${ANDROID_KEY_ALIAS:?Missing ANDROID_KEY_ALIAS}"
+          : "${ANDROID_KEY_PASSWORD:?Missing ANDROID_KEY_PASSWORD}"
+
+          echo "CM_HILBU_STORE_FILE=hilbu-upload.keystore" >> "$GP"
+          echo "CM_HILBU_STORE_PASSWORD=${ANDROID_KEYSTORE_PASSWORD}" >> "$GP"
+          echo "CM_HILBU_KEY_ALIAS=${ANDROID_KEY_ALIAS}" >> "$GP"
+          echo "CM_HILBU_KEY_PASSWORD=${ANDROID_KEY_PASSWORD}" >> "$GP"
+
+          echo "Gradle properties updated for signing."
+
+          # Inject signingConfig into release if not already present
+          APP_BUILD="android/app/build.gradle"
+          if ! grep -q "CM_HILBU_STORE_FILE" "$APP_BUILD"; then
+            echo "Injecting release signingConfig (idempotent)…"
+            awk '
+              BEGIN { inBuildTypes=0; done=0 }
+              /buildTypes/ { inBuildTypes=1 }
+              inBuildTypes && /release[[:space:]]*\{/ && done==0 {
+                print; print "            signingConfig signingConfigs.release"; next
+              }
+              { print }
+            ' "$APP_BUILD" > "$APP_BUILD.tmp" && mv "$APP_BUILD.tmp" "$APP_BUILD"
+
+            # Ensure signingConfigs.release exists
+            if ! grep -q "signingConfigs[[:space:]]*{[[:space:]]*release" "$APP_BUILD"; then
+              awk '
+                /android[[:space:]]*\{/ && added==0 {
+                  print
+                  print "    signingConfigs {"
+                  print "        release {"
+                  print "            storeFile file(\"../"'"'"android/hilbu-upload.keystore"'"\"")"
+                  print "            storePassword System.getenv(\"ANDROID_KEYSTORE_PASSWORD\") ?: project.property(\"CM_HILBU_STORE_PASSWORD\")"
+                  print "            keyAlias System.getenv(\"ANDROID_KEY_ALIAS\") ?: project.property(\"CM_HILBU_KEY_ALIAS\")"
+                  print "            keyPassword System.getenv(\"ANDROID_KEY_PASSWORD\") ?: project.property(\"CM_HILBU_KEY_PASSWORD\")"
+                  print "        }"
+                  print "    }"
+                  added=1; next
+                }
+                { print }
+              ' "$APP_BUILD" > "$APP_BUILD.tmp" && mv "$APP_BUILD.tmp" "$APP_BUILD"
+            fi
+          fi
 
       - name: Android | Build signed AAB (bundleRelease)
         script: |
+          set -e
           cd android
-          ./gradlew clean bundleRelease \
-            -Pandroid.injected.signing.store.file="$CM_BUILD_DIR/android/hilbu-upload.keystore" \
-            -Pandroid.injected.signing.store.password="$ANDROID_KEYSTORE_PASSWORD" \
-            -Pandroid.injected.signing.key.alias="$ANDROID_KEY_ALIAS" \
-            -Pandroid.injected.signing.key.password="$ANDROID_KEY_PASSWORD" \
-            --no-daemon --stacktrace
+          ./gradlew --no-daemon clean
+          ./gradlew --no-daemon :app:bundleRelease
           cd ..
+          # Copy to a predictable artifacts folder
+          mkdir -p build/android
+          AAB=$(find android/app/build/outputs/bundle/release -name "*.aab" | head -n1)
+          [ -n "$AAB" ] && cp "$AAB" build/android/hilbu-release.aab && ls -lh build/android || { echo "AAB not found"; exit 1; }
 
-      - name: iOS | Fetch signing files and set profiles
+      - name: iOS | Fetch signing files and set profiles (App Store Connect API key)
         script: |
+          set -e
+          : "${APPLE_API_KEY_ID:?Missing APPLE_API_KEY_ID}"
+          : "${APPLE_API_ISSUER_ID:?Missing APPLE_API_ISSUER_ID}"
+          : "${APP_STORE_PRIVATE_KEY:?Missing APP_STORE_PRIVATE_KEY}"
+
+          # Write API key to a file Codemagic CLI expects
+          mkdir -p ~/private_keys
+          echo "$APP_STORE_PRIVATE_KEY" > ~/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8
+
+          # Fetch signing files (provisioning profiles & certs)
           app-store-connect fetch-signing-files \
             --issuer-id "$APPLE_API_ISSUER_ID" \
             --key-id "$APPLE_API_KEY_ID" \
-            --private-key "$APP_STORE_PRIVATE_KEY" \
-            --type IOS_APP_STORE "$IOS_BUNDLE_ID" --create
-          keychain initialize
-          keychain add-certificates
+            --private-key-path ~/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8 \
+            --type IOS_APP_STORE \
+            --bundle-id "$(defaults read "$(pwd)/ios/hilburecoveryservice/Info" CFBundleIdentifier 2>/dev/null || /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' ios/hilburecoveryservice/Info.plist)"
+
+          # Point Xcode project to fetched profiles automatically
           xcode-project use-profiles
 
-      - name: iOS | Build IPA (robust workspace & scheme pick, Release)
+      - name: iOS | Build IPA (robust workspace & scheme pick)
         script: |
+          #!/usr/bin/env bash
           set -e
           set -o pipefail
-          # Real .xcworkspace (directory), not internal XML file
+          # Real .xcworkspace (directory), not its internal XML file
           WS=$(find ios -maxdepth 1 -type d -name "*.xcworkspace" | head -n1)
           if [ -z "$WS" ]; then
-            echo "No .xcworkspace found, listing ios/:"; ls -la ios; exit 1
+            echo "No .xcworkspace found, listing ios/:"
+            ls -la ios
+            exit 1
           fi
           echo "Workspace: $WS"
 
@@ -169,16 +250,37 @@ workflows:
           [ -n "$PICK" ] || { echo "Could not find an app scheme among: $SCHEMES"; exit 1; }
           echo "Using app scheme: $PICK"
 
-          # Build IPA with Release configuration (no extra archive/export flags needed)
-          xcode-project build-ipa --workspace "$WS" --scheme "$PICK" --configuration Release --verbose
+          # Build IPA with Codemagic CLI defaults (Release). Do NOT pass unsupported flags.
+          xcode-project build-ipa --workspace "$WS" --scheme "$PICK" --verbose
+
+          # Move IPA to a predictable path
+          mkdir -p build/ios/ipa
+          find . -type f -name "*.ipa" -exec cp {} build/ios/ipa/ \;
+          ls -lh build/ios/ipa
+
+      - name: iOS | Upload to TestFlight
+        script: |
+          set -e
+          : "${APPLE_API_KEY_ID:?Missing APPLE_API_KEY_ID}"
+          : "${APPLE_API_ISSUER_ID:?Missing APPLE_API_ISSUER_ID}"
+          : "${APP_STORE_PRIVATE_KEY:?Missing APP_STORE_PRIVATE_KEY}"
+
+          IPA_PATH=$(find build/ios/ipa -name "*.ipa" | head -n1)
+          [ -n "$IPA_PATH" ] || { echo "IPA not found"; exit 1; }
+
+          mkdir -p ~/private_keys
+          echo "$APP_STORE_PRIVATE_KEY" > ~/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8
+
+          app-store-connect publish \
+            --issuer-id "$APPLE_API_ISSUER_ID" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --private-key-path ~/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8 \
+            --app "$(defaults read "$(pwd)/ios/hilburecoveryservice/Info" CFBundleIdentifier 2>/dev/null || /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' ios/hilburecoveryservice/Info.plist)" \
+            --ipa "$IPA_PATH" \
+            --submit-for-review false
 
     artifacts:
-      - android/app/build/outputs/bundle/release/*.aab
+      - build/android/*.aab
       - build/ios/ipa/*.ipa
-
-    publishing:
-      app_store_connect:
-        api_key: $APP_STORE_PRIVATE_KEY
-        key_id: $APPLE_API_KEY_ID
-        issuer_id: $APPLE_API_ISSUER_ID
-        submit_to_testflight: true
+      - ios/*.dSYM.zip
+      - /tmp/xcodebuild_logs/*.log
